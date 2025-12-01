@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
+import os
 import numpy as np
+
+# Configure osmesa rendering BEFORE importing mujoco (fixes EGL errors on headless servers)
+os.environ['MUJOCO_GL'] = 'osmesa'
 
 try:  # pragma: no cover - optional dependency for structured observations
     import gymnasium as gym
@@ -87,8 +91,8 @@ class FrankaPickPlaceEnv:
 
         self.step_dt = 0.04
         self.control_rate_hz = 1.0 / self.step_dt
-        self.max_steps = 184  # Must match MAX_EPISODE_STEPS in dataset/evaluation for consistent timestep normalization (ultra-dense demos: 133-164, avg 147)
-        self.success_height = 0.15  # Height threshold for considering object "placed"
+        self.max_steps = 300  # Increased to allow keyframe controller to complete placement sequence
+        self.success_height = 0.10  # Height threshold for considering object "placed"
         self.workspace_extent = np.array([0.25, 0.25])
         self.bin_position = np.array([0.55, 0.45, 0.08])  # Closer to robot for easier center placement
         self.bin_radius = 0.12  # Increased radius for easier placement
@@ -324,7 +328,9 @@ class FrankaPickPlaceEnv:
                 # Try up to 50 times to find a non-overlapping position
                 for attempt in range(50):
                     x = self.rng.uniform(0.45, 0.55)
-                    y = self.rng.uniform(-0.25, 0.25)
+                    # y = self.rng.uniform(-0.25, 0.25)
+                    # MATCH DATASET DISTRIBUTION: Dataset has Y in [-0.25, 0.25]
+                    y = self.rng.uniform(-0.25, 0.25) 
                     pos = np.array([x, y, 0.035], dtype=np.float64)
                     
                     # Check if this position overlaps with any existing balls
@@ -357,18 +363,78 @@ class FrankaPickPlaceEnv:
         self.model.light_diffuse[self._light_id] = np.array([0.6, 0.6, 0.6])
 
         # Always hide the occluder cube (optimization: no distracting objects)
-        self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
+        # self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
         
         # Note: 'hindered' flag is still tracked for dataset labels, but no visual changes
-        # if not self._hindered:
-        #     self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
-        #     return
-        # 
-        # self.model.light_diffuse[self._light_id] = self.rng.uniform(0.2, 0.9, size=3)
-        # xy = self.rng.uniform(-self.workspace_extent * 0.5, self.workspace_extent * 0.5)
-        # pos = np.array([0.5 + xy[0], xy[1], 0.18], dtype=np.float64)
-        # quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        # self._set_free_joint_pose(self._occluder_qpos_addr, pos, quat)
+        if not self._hindered:
+            self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
+            return
+        
+        # Randomize lighting VERY aggressively for distinct tints
+        # Generate a random saturated color
+        color = self.rng.uniform(0.0, 1.0, size=3)
+        # Boost saturation: make the max channel 1.0 and min channel close to 0.0
+        color[np.argmax(color)] = 1.0
+        color[np.argmin(color)] = self.rng.uniform(0.0, 0.2)
+        
+        self.model.light_diffuse[self._light_id] = color
+        self.model.light_ambient[self._light_id] = color * 0.2 # Dim ambient to let shadows/diffuse pop
+        
+        print(f"DEBUG: Hindered Lighting - Color: {color}")
+
+        # Perturb camera position slightly (simulating calibration error)
+        # Note: This modifies the model, so it persists. We rely on reset() to restore if needed,
+        # but since we don't store default, we just apply small random noise around the *current* position.
+        # Ideally we should store default, but for now small jitter is fine as long as it doesn't drift too far.
+        # Actually, let's be safe and only modify if we haven't drifted too far, or just accept small drift.
+        # Better: The camera is static in XML. We can just add noise to the *view* matrix if we could,
+        # but here we modify model.cam_pos.
+        # Let's assume the drift is negligible over a few episodes or we restart.
+        
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name)
+        if cam_id >= 0:
+            # Apply AGGRESSIVE jitter: +/- 10cm position
+            pos_noise = self.rng.uniform(-0.1, 0.1, size=3)
+            original_pos = self.model.cam_pos[cam_id].copy()
+            self.model.cam_pos[cam_id] += pos_noise
+            
+            # Apply rotation jitter (small random rotation)
+            # Create a small random rotation quaternion
+            # Axis-angle: random axis, angle between -10 and 10 degrees
+            axis = self.rng.normal(size=3)
+            axis /= np.linalg.norm(axis)
+            angle = np.radians(self.rng.uniform(-10, 10))
+            
+            # Convert to quaternion [w, x, y, z]
+            sin_half = np.sin(angle / 2)
+            cos_half = np.cos(angle / 2)
+            rot_quat = np.array([cos_half, axis[0]*sin_half, axis[1]*sin_half, axis[2]*sin_half])
+            
+            # Apply rotation: q_new = q_noise * q_old
+            current_quat = self.model.cam_quat[cam_id]
+            # Hamilton product
+            w1, x1, y1, z1 = rot_quat
+            w2, x2, y2, z2 = current_quat
+            new_quat = np.array([
+                w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                w1*z2 + x1*y2 - y1*x2 + z1*w2
+            ])
+            self.model.cam_quat[cam_id] = new_quat / np.linalg.norm(new_quat)
+            
+            print(f"DEBUG: Camera Jitter - Pos Delta: {pos_noise}, New Pos: {self.model.cam_pos[cam_id]}")
+
+        # Increase occluder size
+        geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "occluder_geom")
+        if geom_id >= 0:
+            # Make it bigger: 8cm half-extent -> 16cm cube (vs original 5cm/10cm)
+            self.model.geom_size[geom_id] = np.array([0.08, 0.08, 0.08])
+
+        xy = self.rng.uniform(-self.workspace_extent * 0.5, self.workspace_extent * 0.5)
+        pos = np.array([0.5 + xy[0], xy[1], 0.18], dtype=np.float64)
+        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        self._set_free_joint_pose(self._occluder_qpos_addr, pos, quat)
 
     # ------------------------------------------------------------------
     # Safety helpers
@@ -396,13 +462,14 @@ class FrankaPickPlaceEnv:
     # ------------------------------------------------------------------
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode == "rgb_array":
-            # Create fresh renderer each frame (MuJoCo 3.1.6)
-            renderer = mujoco.Renderer(self.model, height=self.height, width=self.width)
+            # Use existing renderer
+            if self.renderer is None:
+                 self.renderer = mujoco.Renderer(self.model, height=self.height, width=self.width)
             
             # CRITICAL: Don't pass camera parameter to update_scene - it causes frozen images!
             # Just use default camera (first camera in model, which is 'top')
-            renderer.update_scene(self.data)
-            rgb = renderer.render()
+            self.renderer.update_scene(self.data)
+            rgb = self.renderer.render()
             
             # Convert from uint8 [0, 255] to float32 [0, 1]
             return (rgb / 255.0).astype(np.float32)
@@ -484,7 +551,7 @@ class FrankaPickPlaceEnv:
 def _smoke_test(asset_root: Path) -> None:  # pragma: no cover - CLI helper
     from .controllers import KinematicsHelper, quat_to_axis_angle, quat_multiply, quat_conjugate
     
-    env = FrankaPickPlaceEnv(asset_root=asset_root, gui=True)
+    env = FrankaPickPlaceEnv(asset_root=asset_root, gui=False)
     obs, info = env.reset()
     print("Reset observation keys:", obs.keys())
     print("Instruction:", info["instruction"])

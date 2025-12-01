@@ -11,12 +11,12 @@ policy:
   value_coef: 1.0  # Higher weight on value learning to fix random initialization
   entropy_coef: 0.01  # Moderate entropy to maintain exploration
   max_grad_norm: 0.5  # Gradient clipping
-  action_std: 0.15  # Higher exploration noise to smooth out KL
+  action_std: 0.001  # Extremely reduced exploration noise to match BC performance
   target_kl: 0.1  # More lenient during warmup phase
 
   # Training schedule - REDUCED FOR QUICK TEST
   num_epochs: 3  # Only 3 epochs for quick test
-  rollout_length: 256  # Shorter rollouts (8x faster)
+  rollout_length: 600  # Shorter rollouts (8x faster)
   ppo_epochs: 4  # More epochs to let value head learn (was 2)
   batch_size: 64  # Minibatch size for PPO updates
 

@@ -6,9 +6,11 @@ import csv
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import cv2
 import numpy as np
 import torch
 from transformers import AutoImageProcessor
+import torchvision.transforms as T
 
 from env.mujoco_env import FrankaPickPlaceEnv
 from models.vla_dinov2 import VLADinoV2Config, VLADinoV2Policy
@@ -41,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable GUI rendering for faster evaluation.",
     )
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Save video of the first successful episode for each mode.",
+    )
     return parser.parse_args()
 
 
@@ -60,14 +67,22 @@ def main() -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if "config" in checkpoint:
         model_cfg = checkpoint["config"]
     
     # Load action statistics for denormalization
     action_stats = checkpoint.get("action_stats", None)
     if action_stats is None:
-        logger.warning("Action statistics not found in checkpoint. Actions will not be denormalized.")
+        # Fallback: Try to load from dataset/action_stats.json
+        stats_path = Path("dataset/action_stats.json")
+        if stats_path.exists():
+            import json
+            with open(stats_path, "r") as f:
+                action_stats = json.load(f)
+            logger.info(f"Loaded action statistics from {stats_path} (fallback).")
+        else:
+            logger.warning("Action statistics not found in checkpoint or disk. Actions will not be denormalized.")
     else:
         logger.info("Loaded action statistics from checkpoint for denormalization.")
     
@@ -75,6 +90,10 @@ def main() -> None:
     uses_bce_gripper = checkpoint.get("uses_bce_gripper", False)
     if uses_bce_gripper:
         logger.info("Model trained with BCE for gripper - will apply sigmoid to gripper output.")
+    else:
+        # DEBUG: Force True for PPO checkpoints that missed the flag
+        logger.warning("uses_bce_gripper not found, forcing TRUE for debugging PPO checkpoint.")
+        uses_bce_gripper = True
 
     model_config = VLADinoV2Config(**model_cfg)
     policy = VLADinoV2Policy(model_config)
@@ -97,6 +116,8 @@ def main() -> None:
         gui=enable_gui,
         seed=evaluation_cfg.get("seed", 0),
     )
+    # Increase max_steps to allow for slower policies
+    env.max_steps = 600
 
     results_dir = Path("results")
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -117,14 +138,18 @@ def main() -> None:
                 mode=selected_mode,
                 action_stats=action_stats,
                 uses_bce_gripper=uses_bce_gripper,
+                save_video=args.save_video,
             )
             save_results(results_dir / f"{selected_mode}_eval.csv", results)
             if selected_mode == "static":
                 save_plot(results_dir / "comparison_plot.png", success_rate, None)
+            
+            avg_reward = sum(item["reward"] for item in results) / len(results) if results else 0.0
             logger.info(
-                "%s success rate: %.2f%%",
+                "%s success rate: %.2f%% | Avg Reward: %.4f",
                 selected_mode.capitalize(),
                 success_rate * 100 if success_rate is not None else float("nan"),
+                avg_reward
             )
             return
 
@@ -137,6 +162,7 @@ def main() -> None:
             mode="static",
             action_stats=action_stats,
             uses_bce_gripper=uses_bce_gripper,
+            save_video=args.save_video,
         )
         hindered_results, hindered_rate = run_rollouts(
             env,
@@ -147,6 +173,7 @@ def main() -> None:
             mode="hindered",
             action_stats=action_stats,
             uses_bce_gripper=uses_bce_gripper,
+            save_video=args.save_video,
         )
 
         save_results(results_dir / "static_eval.csv", static_results)
@@ -170,9 +197,11 @@ def run_rollouts(
     mode: str,
     action_stats: Dict[str, List[float]] | None = None,
     uses_bce_gripper: bool = False,
+    save_video: bool = False,
 ) -> Tuple[List[Dict[str, float]], float | None]:
     logger = get_logger("evaluate_bc")
     results: List[Dict[str, float]] = []
+    video_saved = False
 
     for episode in range(episodes):
         observation, info = env.reset(hindered=mode == "hindered")
@@ -180,18 +209,48 @@ def run_rollouts(
         total_reward = 0.0
         success = False
         step = 0
+        frames = []
         # Use the actual instruction from environment (e.g., "Pick up the blue sphere...")
         instruction_text = info.get("instruction", "Pick up the sphere and place it in the goal bin.")
         
         # Initialize action history buffer for closed-loop control
         history_length = policy.config.history_length
         action_dim = policy.config.action_dim
-        action_history = torch.zeros((history_length, action_dim), dtype=torch.float32, device=device)
+        
+        # Initialize with normalized zeros (matching dataset padding)
+        # Dataset pads with raw zeros, then normalizes.
+        # So we need (0 - mean) / std
+        if action_stats is not None:
+            action_mean = torch.tensor(action_stats["mean"], dtype=torch.float32, device=device)
+            action_std = torch.tensor(action_stats["std"], dtype=torch.float32, device=device)
+            normalized_zero = (torch.zeros(action_dim, device=device) - action_mean) / (action_std + 1e-8)
+            action_history = normalized_zero.unsqueeze(0).repeat(history_length, 1)
+        else:
+            action_history = torch.zeros((history_length, action_dim), dtype=torch.float32, device=device)
 
         while not done:
             step += 1
+            
+            # Capture frame for video
+            if save_video and not video_saved:
+                frame = env.render(mode="rgb_array")
+                frame = (frame * 255).astype(np.uint8)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                frames.append(frame)
+
             # Pass timestep for temporal awareness (helps model learn "close at ~step 120, open at ~step 320")
-            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=184)
+            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=300)
+            
+            # DEBUG: Save the first frame of the first episode
+            # if episode == 0 and step == 1:
+            #     import torchvision.utils as vutils
+            #     # Denormalize for visualization
+            #     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            #     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            #     vis_tensor = rgb_tensor * std + mean
+            #     vutils.save_image(vis_tensor, "debug_input_image.png")
+            #     logger.info("Saved debug_input_image.png")
+
             with torch.no_grad():
                 instructions = [instruction_text] * rgb_tensor.size(0)
                 # Pass action history for closed-loop control
@@ -206,9 +265,13 @@ def run_rollouts(
             if action_stats is not None:
                 action_mean = np.array(action_stats["mean"], dtype=np.float32)
                 action_std = np.array(action_stats["std"], dtype=np.float32)
-                # Denormalize ALL dimensions including gripper
-                # Must match training normalization (all 8 dims normalized)
-                action[0] = action[0] * action_std + action_mean
+                
+                if uses_bce_gripper:
+                    # Only denormalize joints (0-6), leave gripper logit (7) alone
+                    action[0, :7] = action[0, :7] * action_std[:7] + action_mean[:7]
+                else:
+                    # Denormalize ALL dimensions including gripper (MSE training)
+                    action[0] = action[0] * action_std + action_mean
             
             # Handle gripper based on training method
             if uses_bce_gripper:
@@ -222,7 +285,7 @@ def run_rollouts(
                 # logit > -0.8  → prob > 0.31 (very easy to open)
                 # logit >  0.5  → prob > 0.62 (harder to open, more selective)
                 
-                GRIPPER_LOGIT_THRESHOLD = -0.4  # Try -0.4 first (prob ≈ 0.40)
+                GRIPPER_LOGIT_THRESHOLD = 4.0  # Adjusted based on calibration (model outputs ~3.5 when grasping)
                 
                 # Crisp binary decision - no continuous values
                 if gripper_logit > GRIPPER_LOGIT_THRESHOLD:
@@ -255,8 +318,35 @@ def run_rollouts(
             # Sync viewer for GUI visualization (if enabled)
             if hasattr(env, 'viewer') and env.viewer is not None:
                 env.viewer.sync()
+            
+            # DEBUG: Save trajectory for ALL episodes
+            # with open("debug_trajectory.csv", "a") as f:
+            #     # Format: episode, step, gripper_logit, gripper_action, reward, distance, obj_x,obj_y,obj_z,ee_x,ee_y,ee_z
+            #     dist = step_result.info.get("distance", 0.0)
+                
+            #     # Get positions
+            #     try:
+            #         target_site_id = env._object_site_ids[env.target_color]
+            #         obj_pos = env.data.site_xpos[target_site_id]
+            #         ee_pos = env.data.site_xpos[env._gripper_site_id]
+            #         f.write(f"{episode},{step},{gripper_logit},{action[0, 7]},{step_result.reward},{dist},{obj_pos[0]},{obj_pos[1]},{obj_pos[2]},{ee_pos[0]},{ee_pos[1]},{ee_pos[2]}\n")
+            #     except Exception as e:
+            #         print(f"Logging failed: {e}")
+            #         f.write(f"{episode},{step},{gripper_logit},{action[0, 7]},{step_result.reward},{dist},0,0,0,0,0,0\n")
 
         results.append({"episode": episode, "success": float(success), "reward": total_reward})
+
+        # Save video if successful or if it's the first episode (for debugging)
+        if (success or episode == 0) and save_video and frames:
+            status = "success" if success else "failed"
+            video_path = Path(f"results/video_{mode}_{status}_ep{episode}.mp4")
+            height, width, _ = frames[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(str(video_path), fourcc, 25.0, (width, height))
+            for frame in frames:
+                out.write(frame)
+            out.release()
+            logger.info(f"Saved video of {status} {mode} episode {episode} to {video_path}")
 
     if not results:
         return results, 0.0
@@ -265,7 +355,7 @@ def run_rollouts(
     return results, success_rate
 
 
-def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 184) -> Tuple[torch.Tensor, torch.Tensor]:
+def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 300) -> Tuple[torch.Tensor, torch.Tensor]:
     """Preprocess observation for model input.
     
     Args:
@@ -273,7 +363,7 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
         image_processor: HuggingFace image processor
         device: torch device
         timestep: Current timestep in episode (for temporal awareness)
-        max_steps: Maximum episode length for timestep normalization (must match training: 184 for ultra-dense demos)
+        max_steps: Maximum episode length for timestep normalization (must match training: 300)
     
     Returns:
         rgb_tensor: Preprocessed RGB image
@@ -303,9 +393,23 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
         if rgb_array.max() > 1.0:
             rgb_array = rgb_array / 255.0
 
-    # Images already in [0,1] range - disable rescaling
-    inputs = image_processor(images=rgb_array, return_tensors="pt", do_rescale=False)
-    rgb_tensor = inputs["pixel_values"].to(device)
+    # Manual preprocessing to match training exactly
+    # 1. Resize to 224x224
+    # 2. Normalize with ImageNet stats
+    
+    # Convert to tensor (C, H, W) and normalize to [0, 1]
+    rgb_tensor = torch.from_numpy(rgb_array).permute(2, 0, 1).float()
+    
+    # Resize
+    resize = T.Resize((224, 224))
+    rgb_tensor = resize(rgb_tensor)
+    
+    # Normalize
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    rgb_tensor = normalize(rgb_tensor).unsqueeze(0).to(device)
+
+    # FIX: Mirror the image to match training distribution (Camera is mirrored)
+    rgb_tensor = torch.flip(rgb_tensor, [3])
 
     if proprio is None:
         proprio_tensor = torch.zeros(1, 8, device=device)  # 7 joints + 1 timestep
@@ -323,6 +427,9 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
         joint_min = -2.8973
         joint_max = 2.8973
         proprio_tensor = 2.0 * (proprio_tensor - joint_min) / (joint_max - joint_min) - 1.0
+        
+        # TEST: Zero out proprioception to force reliance on vision
+        # proprio_tensor = torch.zeros_like(proprio_tensor)
     
     # Add normalized timestep as 8th dimension (for temporal awareness)
     timestep_normalized = timestep / max(max_steps, 1)  # Normalize to [0, 1]

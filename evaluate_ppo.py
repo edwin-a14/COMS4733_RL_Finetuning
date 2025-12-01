@@ -8,6 +8,7 @@ from typing import Dict, Any
 import numpy as np
 
 import torch
+import torchvision.transforms as T
 from env.mujoco_env import FrankaPickPlaceEnv
 from models.vla_dinov2 import VLADinoV2Config, VLADinoV2Policy
 from utils.logging import get_logger, setup_logging
@@ -84,7 +85,17 @@ def evaluate_policy(
 
             while not done:
                 # Prepare observation
-                rgb = torch.from_numpy(obs["rgb_static"]).to(device).float().permute(2, 0, 1).unsqueeze(0)
+                # (H, W, C) -> (C, H, W)
+                rgb = torch.from_numpy(obs["rgb_static"]).to(device).float().permute(2, 0, 1)
+                
+                # Resize to 224x224
+                resize = T.Resize((224, 224))
+                rgb = resize(rgb)
+                
+                # Normalize with ImageNet stats
+                normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                rgb = normalize(rgb).unsqueeze(0)
+
                 proprio = torch.from_numpy(obs["proprio"]).to(device).float()
 
                 # Add timestep to proprio

@@ -25,6 +25,8 @@ class VLADinoV2Config:
     history_length: int = 5  # Number of past actions to condition on
     use_object_detection: bool = True  # Multi-task learning with object detection
     object_detection_weight: float = 10.0  # Weight for object detection loss
+    use_patches: bool = True  # Use vision patch tokens for spatial reasoning
+    use_aux_features_in_policy: bool = False  # Concatenate color/proprio to policy head
 
 
 class VLADinoV2Policy(nn.Module):
@@ -74,9 +76,13 @@ class VLADinoV2Policy(nn.Module):
         )
         self.fusion = nn.TransformerEncoder(encoder_layer, num_layers=config.fusion_layers)
 
+        policy_input_dim = config.fusion_hidden_dim
+        if config.use_aux_features_in_policy and config.use_object_detection:
+            policy_input_dim += 64  # Color embedding
+
         self.head = nn.Sequential(
-            nn.LayerNorm(config.fusion_hidden_dim),
-            nn.Linear(config.fusion_hidden_dim, config.action_dim),
+            nn.LayerNorm(policy_input_dim),
+            nn.Linear(policy_input_dim, config.action_dim),
         )
 
         # Value head for RL (critic)
@@ -93,6 +99,13 @@ class VLADinoV2Policy(nn.Module):
             self.color_names = ["red", "green", "blue", "yellow", "purple"]
             self.color_embedding = nn.Embedding(len(self.color_names), 64)
             
+            # Projection for injecting color into the main fusion transformer
+            self.color_projection = nn.Sequential(
+                nn.Linear(64, config.fusion_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.fusion_hidden_dim, config.fusion_hidden_dim),
+            )
+            
             self.object_detection_head = nn.Sequential(
                 nn.LayerNorm(config.fusion_hidden_dim + 64),  # +64 for color embedding
                 nn.Linear(config.fusion_hidden_dim + 64, 256),
@@ -104,6 +117,7 @@ class VLADinoV2Policy(nn.Module):
         else:
             self.object_detection_head = None
             self.color_embedding = None
+            self.color_projection = None
 
         if config.freeze_vision:
             for param in self.vision_encoder.parameters():
@@ -131,6 +145,12 @@ class VLADinoV2Policy(nn.Module):
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        
+        if self.config.use_aux_features_in_policy and self.config.use_object_detection:
+            color_ids = self._extract_color_ids(instruction)
+            color_embed = self.color_embedding(color_ids)
+            pooled = torch.cat([pooled, color_embed], dim=-1)
+            
         return self.head(pooled)
 
     def _get_fused_features(
@@ -142,30 +162,53 @@ class VLADinoV2Policy(nn.Module):
     ) -> torch.Tensor:
         """Get fused multimodal features for actor and critic."""
         device = rgb_static.device
+        # image_embedding: (B, N, D) if use_patches else (B, D)
         image_embedding = self._encode_image(rgb_static)
-        text_embedding = self._encode_text(instruction, device=device)
-        proprio_embedding = self.proprio_projection(proprio)
+        
+        # Ensure image_embedding is sequence (B, N, D)
+        if image_embedding.ndim == 2:
+            image_embedding = image_embedding.unsqueeze(1)
+            
+        text_embedding = self._encode_text(instruction, device=device).unsqueeze(1)
+        proprio_embedding = self.proprio_projection(proprio).unsqueeze(1)
+
+        tokens = [image_embedding, text_embedding, proprio_embedding]
+
+        # Inject explicit color embedding if available (crucial for distinguishing targets)
+        if self.color_embedding is not None and self.color_projection is not None:
+            color_ids = self._extract_color_ids(instruction)
+            color_embed = self.color_embedding(color_ids)  # (B, 64)
+            color_token = self.color_projection(color_embed).unsqueeze(1)  # (B, 1, D)
+            tokens.append(color_token)
 
         # Encode action history if provided
         if action_history is not None:
             # Flatten history: (B, H, D) -> (B, H*D)
             batch_size = action_history.shape[0]
             history_flat = action_history.reshape(batch_size, -1)
-            history_embedding = self.action_history_encoder(history_flat)
+            history_embedding = self.action_history_encoder(history_flat).unsqueeze(1)
+            tokens.append(history_embedding)
 
-            # Fuse all modalities including history
-            fusion_tokens = torch.stack([
-                image_embedding,
-                text_embedding,
-                proprio_embedding,
-                history_embedding
-            ], dim=1)
-        else:
-            # Backward compatibility: no history
-            fusion_tokens = torch.stack([image_embedding, text_embedding, proprio_embedding], dim=1)
+        # Concatenate all tokens along sequence dimension
+        fusion_tokens = torch.cat(tokens, dim=1)
 
         fused = self.fusion(fusion_tokens)
-        pooled = fused.mean(dim=1)
+        
+        # Readout strategy:
+        # If using patches, we have [CLS, Patch1...PatchN, Text, Proprio, History]
+        # We want to pool information.
+        # Option 1: Mean pool everything (dilutes non-vision tokens)
+        # Option 2: Use CLS token (index 0) which attended to everything
+        # Option 3: Mean pool only the "special" tokens (CLS, Text, Proprio, History)
+        
+        if self.config.use_patches:
+            # Use the CLS token (first token) as the readout
+            # It has attended to all patches and other modalities
+            pooled = fused[:, 0]
+        else:
+            # Original behavior: mean pool everything (since all are global tokens)
+            pooled = fused.mean(dim=1)
+            
         return pooled
 
     def get_value(
@@ -264,8 +307,17 @@ class VLADinoV2Policy(nn.Module):
                 - value: State values of shape ``(B, 1)``
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
-        action_mean = self.head(pooled)
+        
+        # Value head always uses just the pooled features (critic doesn't need explicit color as much, or maybe it does?)
+        # For now, keep value head simple to avoid changing its architecture too much
         value = self.value_head(pooled)
+
+        if self.config.use_aux_features_in_policy and self.config.use_object_detection:
+            color_ids = self._extract_color_ids(instruction)
+            color_embed = self.color_embedding(color_ids)
+            pooled = torch.cat([pooled, color_embed], dim=-1)
+
+        action_mean = self.head(pooled)
 
         # Sample action from Gaussian policy
         dist = torch.distributions.Normal(action_mean, action_std)
@@ -318,10 +370,18 @@ class VLADinoV2Policy(nn.Module):
             raise ValueError("Images must have shape (B, C, H, W)")
 
         outputs = self.vision_encoder(pixel_values=images)
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            features = outputs.pooler_output
+        
+        if self.config.use_patches:
+            # Return all tokens (CLS + Patches)
+            # last_hidden_state: (B, 257, 768)
+            features = outputs.last_hidden_state
         else:
-            features = outputs.last_hidden_state[:, 0]
+            # Return only CLS token or pooled output
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                features = outputs.pooler_output
+            else:
+                features = outputs.last_hidden_state[:, 0]
+                
         return self.vision_projection(features)
 
     def _encode_text(self, instructions: Iterable[str], device: torch.device) -> torch.Tensor:

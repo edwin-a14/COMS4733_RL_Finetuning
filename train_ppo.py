@@ -22,15 +22,25 @@ from utils.seed import seed_everything
 class ActionHistoryTracker:
     """Tracks action history for temporal context."""
 
-    def __init__(self, history_length: int, action_dim: int, device: torch.device):
+    def __init__(self, history_length: int, action_dim: int, device: torch.device, action_stats: Dict[str, Any] = None):
         self.history_length = history_length
         self.action_dim = action_dim
         self.device = device
+        self.action_stats = action_stats
         self.reset()
 
     def reset(self):
-        """Reset history to zeros."""
-        self.history = torch.zeros(self.history_length, self.action_dim, device=self.device)
+        """Reset history to zeros (or normalized zeros)."""
+        if self.action_stats is not None:
+            # Initialize with normalized zeros (matching dataset padding)
+            # Dataset pads with raw zeros, then normalizes.
+            # So we need (0 - mean) / std
+            action_mean = torch.tensor(self.action_stats["mean"], dtype=torch.float32, device=self.device)
+            action_std = torch.tensor(self.action_stats["std"], dtype=torch.float32, device=self.device)
+            normalized_zero = (torch.zeros(self.action_dim, device=self.device) - action_mean) / (action_std + 1e-8)
+            self.history = normalized_zero.unsqueeze(0).repeat(self.history_length, 1)
+        else:
+            self.history = torch.zeros(self.history_length, self.action_dim, device=self.device)
 
     def update(self, action: torch.Tensor):
         """Update history with new action."""
@@ -52,6 +62,7 @@ def collect_rollout(
     action_stats: Dict[str, Any],
     instruction: str = "Pick up the red sphere and place it in the goal bin.",
     render: bool = False,
+    uses_bce_gripper: bool = False,
 ) -> Dict[str, float]:
     """Collect a rollout using the current policy.
 
@@ -65,6 +76,7 @@ def collect_rollout(
         action_stats: Action statistics for denormalization
         instruction: Language instruction for the task
         render: Whether to render the environment
+        uses_bce_gripper: Whether the model uses BCE for gripper (requires thresholding)
 
     Returns:
         Dictionary of rollout metrics
@@ -76,9 +88,12 @@ def collect_rollout(
         history_length=policy.config.history_length,
         action_dim=policy.config.action_dim,
         device=device,
+        action_stats=action_stats,
     )
 
     obs, info = env.reset()  # Environment returns (obs, info) tuple
+    # FIX: Use instruction from environment (handles random colors)
+    current_instruction = info.get("instruction", instruction)
     action_tracker.reset()
 
     episode_rewards = []
@@ -91,10 +106,27 @@ def collect_rollout(
         for step in range(rollout_length):
             # Prepare observation
             rgb = torch.from_numpy(obs["rgb_static"]).to(device).float().permute(2, 0, 1).unsqueeze(0)
+
+            # Normalize with ImageNet stats (matching evaluate_bc_mujoco.py)
+            # rgb is [1, 3, 224, 224] in [0, 1]
+            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            rgb = (rgb - mean) / std
+
+            # FIX: Mirror the image to match training distribution (Camera is mirrored)
+            rgb = torch.flip(rgb, [3])
+
             proprio = torch.from_numpy(obs["proprio"]).to(device).float()
 
+            # Normalize proprio to [-1, 1] using fixed joint limits (Franka Panda: ±2.8973 rad)
+            joint_min = -2.8973
+            joint_max = 2.8973
+            proprio = 2.0 * (proprio - joint_min) / (joint_max - joint_min) - 1.0
+
             # Add timestep to proprio
-            timestep = torch.tensor([step / env.max_steps], device=device, dtype=torch.float32)
+            # FIX: Use current_episode_length for normalization to match evaluate_bc_mujoco.py
+            # This ensures the policy sees consistent timestep features during training and eval
+            timestep = torch.tensor([current_episode_length / 300.0], device=device, dtype=torch.float32)
             proprio = torch.cat([proprio, timestep], dim=-1).unsqueeze(0)
 
             # Get action history
@@ -103,7 +135,7 @@ def collect_rollout(
             # Get action, log prob, and value from policy
             action, log_prob, value = policy.get_action_and_value(
                 rgb_static=rgb,
-                instruction=[instruction],
+                instruction=[current_instruction],
                 proprio=proprio,
                 action_history=action_history,
                 action_std=action_std,
@@ -114,9 +146,39 @@ def collect_rollout(
             if action_stats is not None:
                 action_mean = np.array(action_stats["mean"])
                 action_std_norm = np.array(action_stats["std"])
-                action_denorm = action_np * action_std_norm + action_mean
+                
+                if uses_bce_gripper:
+                    # Only denormalize joints (0-6), leave gripper logit (7) alone
+                    # Create a copy to avoid modifying the original action_np which might be needed for buffer?
+                    # Actually buffer stores the raw network output (normalized/logit), so we can modify action_denorm
+                    action_denorm = action_np.copy()
+                    action_denorm[:7] = action_np[:7] * action_std_norm[:7] + action_mean[:7]
+                else:
+                    action_denorm = action_np * action_std_norm + action_mean
             else:
-                action_denorm = action_np
+                action_denorm = action_np.copy()
+
+            # Handle gripper based on training method
+            if uses_bce_gripper:
+                # Model trained with BCE: output is logit
+                # Use CRISP BINARY threshold in logit space (more stable than sigmoid)
+                gripper_logit = action_denorm[7]
+                
+                # Threshold tuning guide:
+                # logit >  0.0  → prob > 0.50 (neutral, sigmoid threshold)
+                # logit >  4.0  → prob > 0.98 (very confident open)
+                
+                GRIPPER_LOGIT_THRESHOLD = 4.0  # Matching evaluate_bc_mujoco.py
+                
+                # Crisp binary decision - no continuous values
+                if gripper_logit > GRIPPER_LOGIT_THRESHOLD:
+                    action_denorm[7] = 0.04  # Open
+                else:
+                    action_denorm[7] = 0.0   # Closed
+            else:
+                # Model trained with MSE: round to binary states if needed, or pass continuous
+                # But for consistency with eval script:
+                action_denorm[7] = 0.0 if action_denorm[7] < 0.02 else 0.04
 
             # Step environment (returns StepResult object, not tuple)
             step_result = env.step(action_denorm)
@@ -125,10 +187,15 @@ def collect_rollout(
             done = step_result.terminated or step_result.truncated
             info = step_result.info
 
+            if step % 20 == 0:
+                dist = info.get("distance", -1.0)
+                hist_grip = action_history[0, -1, 7].item()
+                print(f"Step {step}: Gripper Logit={gripper_logit:.4f}, Action={action_denorm[7]:.4f}, Dist={dist:.4f}, HistGrip={hist_grip:.4f}")
+
             # Store in buffer (squeeze batch dimension)
             buffer.add(
                 rgb=rgb.squeeze(0),
-                instruction=instruction,
+                instruction=current_instruction,
                 proprio=proprio.squeeze(0),
                 action_history=action_history.squeeze(0),
                 action=action.squeeze(0),
@@ -139,7 +206,19 @@ def collect_rollout(
             )
 
             # Update action history
-            action_tracker.update(action.squeeze(0))
+            # FIX: If using BCE gripper, we must feed back the NORMALIZED EXECUTED action, not the logit
+            action_for_history = action.squeeze(0).clone()
+            if uses_bce_gripper and action_stats is not None:
+                # Calculate normalized value of the executed binary gripper action
+                # executed value is action_denorm[7] (0.0 or 0.04)
+                # normalized = (executed - mean) / std
+                gripper_val = action_denorm[7]
+                gripper_mean = action_stats["mean"][7]
+                gripper_std = action_stats["std"][7]
+                gripper_normalized = (gripper_val - gripper_mean) / (gripper_std + 1e-8)
+                action_for_history[7] = float(gripper_normalized)
+            
+            action_tracker.update(action_for_history)
 
             # Update episode metrics
             current_episode_reward += reward
@@ -156,6 +235,8 @@ def collect_rollout(
 
                 # Reset environment and trackers
                 obs, info = env.reset()  # Environment returns (obs, info) tuple
+                # FIX: Update instruction for new episode
+                current_instruction = info.get("instruction", instruction)
                 action_tracker.reset()
                 current_episode_reward = 0
                 current_episode_length = 0
@@ -241,6 +322,11 @@ def main() -> None:
     checkpoint_path = args.checkpoint or policy_cfg["checkpoint"]
     logger.info(f"Loading BC checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Check if model was trained with BCE for gripper
+    uses_bce_gripper = checkpoint.get("uses_bce_gripper", False)
+    if uses_bce_gripper:
+        logger.info("Model trained with BCE for gripper - will apply thresholding to gripper output.")
 
     # Create model
     model_config = VLADinoV2Config(**checkpoint["config"])
@@ -248,13 +334,24 @@ def main() -> None:
 
     # Load BC weights (actor head)
     state_dict = checkpoint["model_state"]
-    if "proprio_projection.0.weight" in state_dict:
-        # Slice to keep only first 7 dimensions (remove timestep)
-        state_dict["proprio_projection.0.weight"] = state_dict["proprio_projection.0.weight"][:, :7]
+    # if "proprio_projection.0.weight" in state_dict:
+    #     # Slice to keep only first 7 dimensions (remove timestep)
+    #     state_dict["proprio_projection.0.weight"] = state_dict["proprio_projection.0.weight"][:, :7]
 
     # Load BC weights (actor head)
     policy.load_state_dict(state_dict, strict=False)
-    logger.info("Loaded BC weights (sliced proprio_projection to 7D, value_head initialized randomly)")
+    logger.info("Loaded BC weights (value_head initialized randomly)")
+
+    # FREEZE BACKBONE: Only train the heads to prevent value function from destroying BC features
+    for name, param in policy.named_parameters():
+        if "head" in name:  # Train policy.head and policy.value_head
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
+    # Verify trainable parameters
+    trainable_params = [n for n, p in policy.named_parameters() if p.requires_grad]
+    logger.info(f"Trainable parameters: {trainable_params}")
 
     policy.to(device)
     policy.train()
@@ -269,6 +366,7 @@ def main() -> None:
     )
     logger.info(f"Using reward type: {env.reward_type}")
     # Note: max_steps is hardcoded to 340 in the environment
+    env.max_steps = 600  # Increase max_steps to allow for slower policies (matching evaluate_bc_mujoco.py)
 
     # Create optimizer (convert to float in case YAML parses scientific notation as string)
     learning_rate = float(policy_cfg.get("learning_rate", 5e-6))
@@ -308,6 +406,7 @@ def main() -> None:
 
     global_step = 0
     best_success_rate = -1.0  # Track best success rate
+    best_mean_reward = -float('inf')  # Track best reward for tie-breaking
     best_checkpoint_path = output_dir / "ppo_best.pt"
 
     for epoch in range(num_epochs):
@@ -328,6 +427,7 @@ def main() -> None:
             action_std=action_std,
             action_stats=action_stats,
             render=args.render,
+            uses_bce_gripper=uses_bce_gripper,
         )
 
         # Get last value for GAE
@@ -357,7 +457,10 @@ def main() -> None:
 
         # Train with PPO
         logger.info("Training with PPO...")
-        policy.train()
+        # CRITICAL: Use eval mode during PPO update to disable dropout!
+        # If we use train(), dropout will cause the policy to output different values
+        # than during rollout (where eval() was used), causing massive KL divergence immediately.
+        policy.eval() 
         train_metrics = ppo_trainer.train_step(
             batch=batch,
             num_epochs=ppo_epochs,
@@ -394,10 +497,20 @@ def main() -> None:
             logger.warning(f"Very high loss detected: {train_metrics['loss/total']:.2f}")
             logger.warning("Training may be diverging. Consider lowering learning rate.")
 
-        # Save best checkpoint based on success rate
+        # Save best checkpoint based on success rate (with reward tie-breaking)
         current_success_rate = rollout_metrics.get("rollout/success_rate", 0.0)
+        current_mean_reward = rollout_metrics.get("rollout/mean_reward", -float('inf'))
+        
+        is_best = False
         if current_success_rate > best_success_rate:
+            is_best = True
+        elif current_success_rate == best_success_rate and current_mean_reward > best_mean_reward:
+            is_best = True
+            
+        if is_best:
             best_success_rate = current_success_rate
+            best_mean_reward = current_mean_reward
+            logger.info(f"Saving best checkpoint with uses_bce_gripper={uses_bce_gripper}, action_stats={'present' if action_stats else 'None'}")
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": policy.state_dict(),
@@ -405,8 +518,11 @@ def main() -> None:
                 "config": model_config.__dict__,
                 "global_step": global_step,
                 "success_rate": best_success_rate,
+                "mean_reward": best_mean_reward,
+                "action_stats": action_stats,
+                "uses_bce_gripper": uses_bce_gripper,
             }, best_checkpoint_path)
-            logger.info(f"✓ New best success rate: {best_success_rate:.2%} - Saved to {best_checkpoint_path}")
+            logger.info(f"✓ New best model: Success={best_success_rate:.2%}, Reward={best_mean_reward:.2f} - Saved to {best_checkpoint_path}")
 
     # Save final checkpoint (last epoch)
     final_checkpoint_path = output_dir / "ppo_last.pt"
@@ -416,6 +532,8 @@ def main() -> None:
         "optimizer_state": optimizer.state_dict(),
         "config": model_config.__dict__,
         "global_step": global_step,
+        "action_stats": action_stats,
+        "uses_bce_gripper": uses_bce_gripper,
     }, final_checkpoint_path)
     logger.info(f"Saved final checkpoint to {final_checkpoint_path}")
     logger.info(f"Best success rate achieved: {best_success_rate:.2%} (saved at {best_checkpoint_path})")

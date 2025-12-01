@@ -89,20 +89,25 @@ class RobotVisionAugmentation:
         # Training: apply augmentations
         
         # 1. Random resized crop (slight zoom/crop)
-        if random.random() > 0.3:  # Apply 70% of the time
-            i, j, h, w = T.RandomResizedCrop.get_params(
-                img,
-                scale=self.crop_scale,
-                ratio=(0.95, 1.05)  # Keep roughly square
-            )
-            img = TF.resized_crop(img, i, j, h, w, (self.image_size, self.image_size))
-        else:
-            img = TF.resize(img, (self.image_size, self.image_size))
+        # DISABLED: Spatial augmentations break the mapping between pixels and absolute joint actions!
+        # if random.random() > 0.3:  # Apply 70% of the time
+        #     i, j, h, w = T.RandomResizedCrop.get_params(
+        #         img,
+        #         scale=self.crop_scale,
+        #         ratio=(0.95, 1.05)  # Keep roughly square
+        #     )
+        #     img = TF.resized_crop(img, i, j, h, w, (self.image_size, self.image_size))
+        # else:
+        #     img = TF.resize(img, (self.image_size, self.image_size))
+        
+        # Always resize to target size
+        img = TF.resize(img, (self.image_size, self.image_size))
         
         # 2. Random rotation (small angles)
-        if random.random() > 0.5:
-            angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
-            img = TF.rotate(img, angle, fill=(128, 128, 128))
+        # DISABLED: Spatial augmentations break the mapping between pixels and absolute joint actions!
+        # if random.random() > 0.5:
+        #     angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
+        #     img = TF.rotate(img, angle, fill=(128, 128, 128))
         
         # 3. Color jitter
         if random.random() > 0.3:  # Apply 70% of the time

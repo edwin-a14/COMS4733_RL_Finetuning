@@ -1,5 +1,5 @@
 dataset:
-  path: ./dataset
+  path: ./dataset_old
   train_split: train
   val_split: val
   batch_size: 16
@@ -7,22 +7,24 @@ dataset:
   sequence_length: 1
   normalize_proprio: true
   cache_dataset: false
+
 model:
   vision_encoder: facebook/dinov2-base
   language_encoder: bert-base-uncased
-  fusion_hidden_dim: 384
-  fusion_layers: 2
+  fusion_hidden_dim: 512
+  fusion_layers: 3
   action_dim: 8
   max_instruction_tokens: 64
-  freeze_vision: false
+  freeze_vision: true  # Freeze pretrained vision - it already has good features
   freeze_language: true
-  dropout: 0.15
+  dropout: 0.1
   history_length: 5
-  use_object_detection: true
-  object_detection_weight: 30.0
+  use_object_detection: false  # DISABLE - model must learn from RGB alone
+  object_detection_weight: 0.0
+
 training:
-  epochs: 40
-  lr: 7.0e-05
+  epochs: 10  # Quick test
+  lr: 0.0001  # Slightly higher since only training fusion/head
   weight_decay: 0.01
   grad_clip: 5.0
   device: cuda
@@ -30,11 +32,12 @@ training:
   log_interval: 10
   val_interval: 1
   checkpoint_dir: ./runs
-  checkpoint_name: dinov2_bc
+  checkpoint_name: dinov2_bc_no_objdet_quick
   mixed_precision: true
   deterministic: false
+
 evaluation:
-  episodes_static: 50
-  episodes_hindered: 50
+  episodes_static: 10  # Quick eval
+  episodes_hindered: 10
   asset_root: ./env/mujoco_assets
   render: false

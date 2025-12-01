@@ -126,6 +126,7 @@ def main() -> None:
         else None
     )
     criterion = nn.MSELoss()
+    bce_criterion = nn.BCEWithLogitsLoss()
 
     checkpoint_dir = Path(training_cfg.get("checkpoint_dir", "./runs"))
     if not args.dry_run:
@@ -170,6 +171,7 @@ def main() -> None:
             model,
             train_loader,
             criterion,
+            bce_criterion,
             optimizer,
             device,
             training_cfg.get("log_interval", 10),
@@ -177,6 +179,7 @@ def main() -> None:
             scaler=scaler,
             epoch=epoch,
             total_epochs=training_cfg["epochs"],
+            proprio_dropout=training_cfg.get("proprio_dropout", 0.0),
         )
         logger.info("Epoch %d | train_loss=%.5f", epoch, train_loss)
 
@@ -184,7 +187,7 @@ def main() -> None:
             scheduler.step()
 
         if (epoch % training_cfg.get("val_interval", 1)) == 0:
-            val_loss = evaluate(model, val_loader, criterion, device, epoch=epoch, total_epochs=training_cfg["epochs"])
+            val_loss = evaluate(model, val_loader, criterion, bce_criterion, device, epoch=epoch, total_epochs=training_cfg["epochs"])
             logger.info("Epoch %d | val_loss=%.5f", epoch, val_loss)
 
             if val_loss < best_val_loss:
@@ -194,14 +197,16 @@ def main() -> None:
                 torch.save({
                     "model_state": model.state_dict(),
                     "config": model_config.__dict__,
-                    "action_stats": action_stats
+                    "action_stats": action_stats,
+                    "uses_bce_gripper": True
                 }, checkpoint_path)
 
         last_checkpoint_path = checkpoint_dir / f"{training_cfg.get('checkpoint_name', 'bc_run')}_last.pt"
         torch.save({
             "model_state": model.state_dict(),
             "config": model_config.__dict__,
-            "action_stats": action_stats
+            "action_stats": action_stats,
+            "uses_bce_gripper": True
         }, last_checkpoint_path)
 
 
@@ -209,6 +214,7 @@ def train_one_epoch(
     model: VLADinoV2Policy,
     dataloader: DataLoader,
     criterion: nn.Module,
+    bce_criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
     log_interval: int,
@@ -216,6 +222,7 @@ def train_one_epoch(
     scaler: Optional[GradScaler] = None,
     epoch: int = 1,
     total_epochs: int = 35,
+    proprio_dropout: float = 0.0,
 ) -> float:
     model.train()
     tracker = MetricTracker()
@@ -232,6 +239,11 @@ def train_one_epoch(
         if instructions is None:
             instructions = [""] * rgb.size(0)
 
+        # Apply Proprioception Dropout
+        if proprio_dropout > 0.0:
+            mask = (torch.rand(proprio.size(0), device=device) > proprio_dropout).float().unsqueeze(1)
+            proprio = proprio * mask
+
         optimizer.zero_grad()
         
         # Mixed precision forward pass
@@ -239,11 +251,15 @@ def train_one_epoch(
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
             
             # Compute weighted loss with HIGHER gripper weighting
-            # Need strong emphasis on gripper to learn open/close behavior
-            gripper_weight = 10.0  # Fixed high weight (not adaptive)
+            gripper_weight = 10.0
             
             joint_loss = criterion(pred[:, :7], target[:, :7])
-            gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
+            
+            # BCE Loss for Gripper
+            # Threshold for normalized target: (0.02 - 0.0145) / 0.0192 = 0.286
+            # We use 0.286 as the threshold to determine if gripper should be open (1) or closed (0)
+            gripper_target_bin = (target[:, 7:8] > 0.286).float()
+            gripper_loss = bce_criterion(pred[:, 7:8], gripper_target_bin)
             
             # Multi-task learning: Add object detection auxiliary loss
             # This forces the model to learn explicit visual grounding before action prediction
@@ -309,6 +325,7 @@ def evaluate(
     model: VLADinoV2Policy, 
     dataloader: DataLoader, 
     criterion: nn.Module, 
+    bce_criterion: nn.Module,
     device: torch.device,
     epoch: int = 1,
     total_epochs: int = 35,
@@ -330,10 +347,13 @@ def evaluate(
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
             
             # Use same high gripper weight as training
-            gripper_weight = 10.0  # Fixed high weight (same as training)
+            gripper_weight = 10.0
             
             joint_loss = criterion(pred[:, :7], target[:, :7])
-            gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
+            
+            # BCE Loss for Gripper
+            gripper_target_bin = (target[:, 7:8] > 0.286).float()
+            gripper_loss = bce_criterion(pred[:, 7:8], gripper_target_bin)
             
             # Multi-task learning: Add object detection auxiliary loss (same as training)
             object_detection_loss = torch.tensor(0.0, device=device)

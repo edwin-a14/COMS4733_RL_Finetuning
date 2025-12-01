@@ -7,6 +7,5 @@ numpy
 opencv-python
 matplotlib
 pandas
-lerobot
 pyyaml
 pillow

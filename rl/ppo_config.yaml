@@ -3,21 +3,21 @@
 
 policy:
   # Checkpoint from BC pre-training (warmup phase)
-  checkpoint: ./runs/dinov2_bc_best.pt
+  checkpoint: ./runs/dinov2_bc_no_objdet_best.pt
 
   # PPO hyperparameters (MODERATE - BC can grasp, just wrong transport direction)
-  learning_rate: 1e-6  # Low but reasonable (BC is partially working!)
-  clip_range: 0.05  # Moderate clipping
-  value_coef: 0.5  # Coefficient for value loss
-  entropy_coef: 0.0  # No entropy bonus
-  max_grad_norm: 0.3  # Allow larger gradients
-  action_std: 0.02  # Some exploration to find correct direction
-  target_kl: 0.02  # Standard tolerance
+  learning_rate: 1e-7  # Reduced to 1e-7 to match successful quick test
+  clip_range: 0.05  # Reduced to 0.05 (match quick test)
+  value_coef: 1.0  # Increased to 1.0 (match quick test)
+  entropy_coef: 0.01  # Increased to 0.01 (match quick test)
+  max_grad_norm: 0.5  # Increased from 0.3
+  action_std: 0.001  # Reduced to 0.001 (match quick test)
+  target_kl: 0.1  # Increased from 0.05 to allow initial adjustment
 
   # Training schedule (constrained by user: max 35 epochs, 1024 rollout)
   num_epochs: 35  # Total number of rollout epochs
-  rollout_length: 512  # Steps to collect per epoch (~5 complete episodes at 200 steps each)
-  ppo_epochs: 2  # Two gradient steps (BC is good starting point)
+  rollout_length: 600  # Increased to 600 to match env.max_steps (was 512)
+  ppo_epochs: 4  # Increased to 4 (match quick test)
   batch_size: 64  # Moderate batch size
 
   # Discount and GAE
